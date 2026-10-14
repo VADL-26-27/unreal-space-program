@@ -91,10 +91,7 @@ From the Windows simulation computer, run:
 ping 192.168.50.2
 ```
 
-Replies prove Windows can reach the receiver through the Ethernet subnet. You do
-not need to run both pings simultaneously. A ping from the Mac to Windows may
-time out because Windows commonly blocks inbound ICMP; that does not prevent
-Windows from sending UDP telemetry to the Mac.
+Replies prove Windows can reach the receiver through the Ethernet subnet. A ping from the Mac to Windows may time out because Windows commonly blocks inbound ICMP; that does not prevent Windows from sending UDP telemetry to the Mac. As long as the computer running the sim can send the ping, that's all that matters.
 
 If Windows cannot ping the Mac, confirm that both wired interfaces show a link
 and that their addresses are exactly `192.168.50.1/24` and
@@ -189,7 +186,6 @@ New-NetFirewallRule -DisplayName "Unreal Rocket UDP Telemetry" -Direction Inboun
 
 ## Troubleshooting
 
-- **No Ethernet adapter:** connect the cable first, then reopen `ncpa.cpl`.
 - **Windows can ping the Mac, but no telemetry appears:** verify `bAutoStart`,
   `TelemetryAddress`, and `TelemetryPort` on the actual `BP_Rocket` instance in
   `Map_Rocket`; then check Unreal's Output Log for `RocketUdpBridge`.
