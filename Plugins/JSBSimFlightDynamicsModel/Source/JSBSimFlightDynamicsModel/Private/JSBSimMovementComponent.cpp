@@ -149,6 +149,7 @@ void UJSBSimMovementComponent::LoadAircraft(bool ResetToDefaultSettings)
 	// It seems like we can only load the model once after having been initialized - So we have to Reinit JSBSim when changing the model.
 	DeInitializeJSBSim();
 	InitializeJSBSim();
+	bHasLastGoodGround = false;
 	AircraftLoaded = Exec->LoadModel(std::string(TCHAR_TO_UTF8(*AircraftModel)));
 
 	if (!AircraftLoaded)
@@ -187,6 +188,14 @@ double UJSBSimMovementComponent::GetAGLevel(const FVector& StartECEFLocation, FV
     return 0.0;
   }
 
+  // A diverged FDM can't be ground-tested, and tracing with NaN endpoints trips engine ensures
+  if (StartECEFLocation.ContainsNaN())
+  {
+    ECEFContactPoint = FVector::ZeroVector;
+    ECEFNormal = FVector::ZAxisVector;
+    return 0.0;
+  }
+
   // Get local Up vector at the query ECEF Location
   FTransform TangentTransform = GeoReferencingSystem->GetTangentTransformAtECEFLocation(StartECEFLocation);
   FVector Up = TangentTransform.TransformVector(FVector::ZAxisVector);
@@ -194,7 +203,6 @@ double UJSBSimMovementComponent::GetAGLevel(const FVector& StartECEFLocation, FV
   // Compute the raycast Origin point
   FVector StartEngineLocation;
   GeoReferencingSystem->ECEFToEngine(StartECEFLocation, StartEngineLocation);
-  FVector LineCheckStart = StartEngineLocation + AGLThresholdMeters * 100 * Up; // slightly above the starting point
 
   // Compute the raycast end point
   // Estimate raycast length - Altitude + 5% of ellipsoid radius in case of negative altitudes
@@ -214,9 +222,58 @@ double UJSBSimMovementComponent::GetAGLevel(const FVector& StartECEFLocation, FV
 
   //DrawDebugLine(GetWorld(), LineCheckStart, LineCheckEnd , FColor::Blue, false, -1, 0, 3);
 
-  // Do Query
+  const auto ThrottledGroundWarning = [this](const FString& Message)
+  {
+    const double Now = FPlatformTime::Seconds();
+    if (Now - LastGroundWarningTime >= 1.0)
+    {
+      LastGroundWarningTime = Now;
+      UE_LOG(LogJSBSim, Warning, TEXT("AGL: %s"), *Message);
+    }
+  };
+
+  // Do Query. First look down from the query point itself, so anything overhead can never be
+  // mistaken for the ground.
+  const FVector BelowTraceStart = StartEngineLocation + Up; // 1 cm above the query point
+  bool bHit = GetWorld()->LineTraceSingleByObjectType(HitResult, BelowTraceStart, LineCheckEnd, ObjectParams, CollisionParams);
+  if (bHit)
+  {
+    FGeographicCoordinates GroundGeographic;
+    GeoReferencingSystem->EngineToGeographic(HitResult.ImpactPoint, GroundGeographic);
+    LastGoodGroundAltitudeMeters = GroundGeographic.Altitude;
+    bHasLastGoodGround = true;
+  }
+  else
+  {
+    // Nothing below: the query point may have sunk into the ground, which is only seen by tracing
+    // from above it. Any hit is above the query point, so check it really is the ground.
+    FHitResult MarginHit;
+    const FVector MarginTraceStart = StartEngineLocation + AGLThresholdMeters * 100 * Up;
+    if (GetWorld()->LineTraceSingleByObjectType(MarginHit, MarginTraceStart, LineCheckEnd, ObjectParams, CollisionParams))
+    {
+      FGeographicCoordinates SurfaceGeographic;
+      GeoReferencingSystem->EngineToGeographic(MarginHit.ImpactPoint, SurfaceGeographic);
+      if (!bHasLastGoodGround || SurfaceGeographic.Altitude <= LastGoodGroundAltitudeMeters + MaxGroundRiseMeters)
+      {
+        HitResult = MarginHit;
+        bHit = true;
+        if (!bHasLastGoodGround)
+        {
+          LastGoodGroundAltitudeMeters = SurfaceGeographic.Altitude;
+          bHasLastGoodGround = true;
+        }
+      }
+      else
+      {
+        ThrottledGroundWarning(FString::Printf(TEXT("ignoring surface overhead at %.2fm, last ground %.2fm (actor=%s component=%s)"),
+          SurfaceGeographic.Altitude, LastGoodGroundAltitudeMeters,
+          *GetNameSafe(MarginHit.GetActor()), *GetNameSafe(MarginHit.GetComponent())));
+      }
+    }
+  }
+
   double HAT = 0.0;
-  if (GetWorld()->LineTraceSingleByObjectType(HitResult, LineCheckStart, LineCheckEnd, ObjectParams, CollisionParams))
+  if (bHit)
   {
     //DrawDebugLine(GetWorld(), HitResult.ImpactPoint, HitResult.ImpactPoint + HitResult.ImpactNormal*100.0, FColor::Orange, false, -1, 0, 3);
 
@@ -233,14 +290,17 @@ double UJSBSimMovementComponent::GetAGLevel(const FVector& StartECEFLocation, FV
   else
   {
     // Raycast failed (no collision under the query point - e.g. terrain tiles not loaded or
-    // physics meshes disabled). Fall back to the sea-level ellipsoid as the ground, like
-    // JSBSim's default ground callback. Returning a zeroed contact point here would make
-    // JSBSim believe the terrain is at the center of the earth, producing garbage
-    // ground-reaction forces and letting the vehicle fall to sea level.
+    // physics meshes disabled). Keep using the last ground we saw, so a streaming gap doesn't
+    // drop the ground out from under the vehicle. If we have never seen any ground, fall back to
+    // the sea-level ellipsoid, like JSBSim's default ground callback. Returning a zeroed contact
+    // point here would make JSBSim believe the terrain is at the center of the earth.
     FGeographicCoordinates QueryGeographic;
     GeoReferencingSystem->ECEFToGeographic(StartECEFLocation, QueryGeographic);
-    HAT = QueryGeographic.Altitude;
-    QueryGeographic.Altitude = 0.0;
+    const double GroundAltitude = bHasLastGoodGround ? LastGoodGroundAltitudeMeters : 0.0;
+    ThrottledGroundWarning(FString::Printf(TEXT("ground ray found nothing at %.2fm, using %s %.2fm"),
+      QueryGeographic.Altitude, bHasLastGoodGround ? TEXT("last ground") : TEXT("sea level"), GroundAltitude));
+    HAT = QueryGeographic.Altitude - GroundAltitude;
+    QueryGeographic.Altitude = GroundAltitude;
     GeoReferencingSystem->GeographicToECEF(QueryGeographic, ECEFContactPoint);
     ECEFNormal = Up;
   }
@@ -258,10 +318,12 @@ double UJSBSimMovementComponent::GetAGLevel(const FVector& StartECEFLocation, FV
       FGeographicCoordinates QGeo, IGeo;
       GeoReferencingSystem->ECEFToGeographic(StartECEFLocation, QGeo);
       GeoReferencingSystem->ECEFToGeographic(ECEFContactPoint, IGeo);
-      UE_LOG(LogJSBSim, Display, TEXT("AGL: hit=%d  AGL=%.1fft  vehicleAlt=%.2fm terrainAlt=%.2fm  queryEngineZ=%.1f impactEngineZ=%.1f  (ray starts %.1fm above vehicle)"),
-        HitResult.bBlockingHit ? 1 : 0, HAT * METER_TO_FEET,
+      UE_LOG(LogJSBSim, Display, TEXT("AGL: hit=%d  AGL=%.1fft  vehicleAlt=%.2fm terrainAlt=%.2fm  queryEngineZ=%.1f impactEngineZ=%.1f  actor=%s component=%s"),
+        bHit ? 1 : 0, HAT * METER_TO_FEET,
         QGeo.Altitude, IGeo.Altitude, StartEngineLocation.Z,
-        HitResult.bBlockingHit ? HitResult.ImpactPoint.Z : 0.0, AGLThresholdMeters);
+        bHit ? HitResult.ImpactPoint.Z : 0.0,
+        bHit ? *GetNameSafe(HitResult.GetActor()) : TEXT("none"),
+        bHit ? *GetNameSafe(HitResult.GetComponent()) : TEXT("none"));
     }
   }
   return HAT;
@@ -297,9 +359,20 @@ void UJSBSimMovementComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 			CopyToJSBSim();
 			
       //step sim x times per game tick
-      for (int i = 0; i < simloops; i++)
+      if (!bHoldSimulation)
       {
-        Exec->Run();
+        for (int i = 0; i < simloops; i++)
+        {
+          Exec->Run();
+
+          // Stop at the first bad step, leaving AircraftState and the actor at the last good frame
+          if (HasNonFiniteState())
+          {
+            HandleNonFiniteState(i);
+            TickTime = (FPlatformTime::Seconds() - Start) * 1000.0;
+            return;
+          }
+        }
       }
 
             // The CG location in the reference frame can vary over time, for instance when tanks get empty... 
@@ -722,7 +795,10 @@ void UJSBSimMovementComponent::CopyFromJSBSim()
 	AircraftState.EulerRates.Set(Auxiliary->GetEulerRates(JSBSim::FGJSBBase::ePhi), Auxiliary->GetEulerRates(JSBSim::FGJSBBase::eTht), Auxiliary->GetEulerRates(JSBSim::FGJSBBase::ePsi));
 	AircraftState.AltitudeAGLFt = Propagate->GetDistanceAGL();
 	// force a sim crashed if crashed (altitude AGL < 0)
-	if (AircraftState.AltitudeAGLFt < -10.0 || AircraftState.AltitudeASLFt < -10.0) {
+	// Height above sea level is deliberately not checked: terrain can be below sea level, and a wrong
+	// georeference origin must not stop the simulation.
+	if (AircraftState.AltitudeAGLFt < -10.0) {
+		UE_LOG(LogJSBSim, Warning, TEXT("Aircraft crashed: AGL=%.1fft ASL=%.1fft VS=%.1ffps"), AircraftState.AltitudeAGLFt, AircraftState.AltitudeASLFt, AircraftState.AltitudeRateFtps);
 		Exec->SuspendIntegration();
 		AircraftState.Crashed = true;
 	  AircraftCrashed.Broadcast();
@@ -736,6 +812,58 @@ void UJSBSimMovementComponent::CopyFromJSBSim()
 }
 
 /////////// JSBSim Private methods
+bool UJSBSimMovementComponent::HasNonFiniteState() const
+{
+	JSBSim::FGLocation Location = Propagate->GetLocation();
+	for (int Axis = 1; Axis <= 3; Axis++)
+	{
+		if (!FMath::IsFinite(Location(Axis)) || !FMath::IsFinite(Propagate->GetUVW(Axis)) ||
+			!FMath::IsFinite(Propagate->GetPQR(Axis)) || !FMath::IsFinite(Propagate->GetEuler(Axis)))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+void UJSBSimMovementComponent::HandleNonFiniteState(int32 SubStep)
+{
+	const auto FormatVector = [](const JSBSim::FGColumnVector3& V)
+	{
+		return FString::Printf(TEXT("(%g, %g, %g)"), V(1), V(2), V(3));
+	};
+
+	UE_LOG(LogJSBSim, Error, TEXT("FDM state went NaN/Inf at sim time %.3fs (substep %d of %d) - stopping the simulation."), Exec->GetSimTime(), SubStep + 1, simloops);
+	UE_LOG(LogJSBSim, Error, TEXT("  Last good frame: AGL=%.1fft ASL=%.1fft VS=%.1ffps Yaw=%.1f Pitch=%.1f Roll=%.1f"),
+		AircraftState.AltitudeAGLFt, AircraftState.AltitudeASLFt, AircraftState.AltitudeRateFtps,
+		AircraftState.LocalEulerAngles.Yaw, AircraftState.LocalEulerAngles.Pitch, AircraftState.LocalEulerAngles.Roll);
+	UE_LOG(LogJSBSim, Error, TEXT("  Now: UVW=(%g, %g, %g) PQR=(%g, %g, %g) Euler=(%g, %g, %g)"),
+		Propagate->GetUVW(1), Propagate->GetUVW(2), Propagate->GetUVW(3),
+		Propagate->GetPQR(1), Propagate->GetPQR(2), Propagate->GetPQR(3),
+		Propagate->GetEuler(1), Propagate->GetEuler(2), Propagate->GetEuler(3));
+
+	// The first of these to show NaN points at the model that produced it
+	UE_LOG(LogJSBSim, Error, TEXT("  Forces (lbf):    aero=%s propulsion=%s ground=%s"),
+		*FormatVector(Aerodynamics->GetForces()), *FormatVector(Propulsion->GetForces()), *FormatVector(GroundReactions->GetForces()));
+	UE_LOG(LogJSBSim, Error, TEXT("  Moments (lbf-ft): aero=%s propulsion=%s ground=%s"),
+		*FormatVector(Aerodynamics->GetMoments()), *FormatVector(Propulsion->GetMoments()), *FormatVector(GroundReactions->GetMoments()));
+
+	static const TCHAR* const Properties[] = {
+		TEXT("inertia/mass-slugs"), TEXT("aero/qbar-psf"), TEXT("velocities/vt-fps"), TEXT("aero/alpha-rad"), TEXT("aero/beta-rad"),
+		TEXT("atmosphere/wind-north-fps"), TEXT("atmosphere/wind-east-fps"), TEXT("atmosphere/turb-type"), TEXT("atmosphere/turb-gain")
+	};
+	for (const TCHAR* const Property : Properties)
+	{
+		FString Value;
+		CommandConsole(Property, TEXT(""), Value);
+		UE_LOG(LogJSBSim, Error, TEXT("  %s = %s"), Property, *Value);
+	}
+
+	Exec->SuspendIntegration();
+	AircraftState.Crashed = true;
+	AircraftCrashed.Broadcast();
+}
+
 void UJSBSimMovementComponent::DoTrim()
 {
 	JSBSim::FGTrim* Trim;

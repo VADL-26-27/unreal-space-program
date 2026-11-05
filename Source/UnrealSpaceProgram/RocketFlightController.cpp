@@ -24,6 +24,10 @@ void URocketFlightController::BeginPlay()
 			Move->EngineCommands[EngineIndex].Running = false;
 			Move->EngineCommands[EngineIndex].Starter = false;
 		}
+
+		// Don't simulate until ignition: the rocket really is at rest on the pad, so ground
+		// contact forces can't move it while the actor is held there (ARocketPawn::UpdateRail).
+		Move->bHoldSimulation = true;
 	}
 	else
 	{
@@ -211,6 +215,7 @@ void URocketFlightController::Ignite()
 	Cmd.Mixture = 1.0;
 	Cmd.Starter = true;
 	Cmd.Running = true;
+	Move->bHoldSimulation = false;
 
 	bMotorIgnited = true;
 	TimeSinceIgnitionSeconds = 0.0f;
@@ -425,6 +430,7 @@ void URocketFlightController::ResetFlight()
 	{
 		FString OutValue;
 		Move->CommandConsole(TEXT("systems/fins-effective"), TEXT("1.0"), OutValue);
+		Move->bHoldSimulation = true;
 	}
 	bAirframeSeparated = false;
 

@@ -298,6 +298,7 @@ ARocketPawn::ARocketPawn()
 	JSBSim->bStartWithEngineRunning = false; // stay inert until commanded to ignite
 	JSBSim->bStartWithGearDown = false;
 	JSBSim->DrawDebug = false;            // the flight controller draws its own concise HUD
+	JSBSim->AGLThresholdMeters = 2.0f;    // ample for a 2.8 m rocket; the 15 m default reaches into overhead scenery
 
 	// --- Launch/recovery state machine ---
 	FlightController = CreateDefaultSubobject<URocketFlightController>(TEXT("FlightController"));
@@ -1069,6 +1070,12 @@ void ARocketPawn::SampleAirflow()
 		FCString::Atof(*Values[0]),
 		FCString::Atof(*Values[1]),
 		-FCString::Atof(*Values[2]));
+
+	// The FDM stops when it diverges, but these properties still read NaN - keep it out of the visuals.
+	if (AirVelocityFps.ContainsNaN())
+	{
+		return;
+	}
 
 	AirspeedFps = AirVelocityFps.Size();
 

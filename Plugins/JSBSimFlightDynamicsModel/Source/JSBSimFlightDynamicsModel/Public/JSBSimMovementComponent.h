@@ -81,6 +81,21 @@ public:
 	float AGLThresholdMeters = 15;
 
 	/**
+	 * A surface found ABOVE a query point is only accepted as "ground the vehicle has sunk into" if it is
+	 * at most this far (meters) above the last ground seen below the vehicle. Anything higher is an
+	 * overhead obstacle or bad collision, not the ground, and is ignored.
+	*/
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "Model|Settings", meta = (ClampMin = "0.0"))
+	float MaxGroundRiseMeters = 1.0f;
+
+	/**
+	 * While true the FDM is not stepped: the vehicle stays exactly at its initial conditions, while commands,
+	 * state and transforms keep updating. Lets a vehicle wait on a pad without ground contact forces acting on it.
+	*/
+	UPROPERTY(Transient, BlueprintReadWrite, VisibleAnywhere, Category = "State")
+	bool bHoldSimulation = false;
+
+	/**
 	 * Center of Gravity Location in Actor local frame
 	*/
 	UPROPERTY(BlueprintReadOnly, VisibleAnywhere, Category = "Model|Reference Points")
@@ -331,8 +346,19 @@ private:
 	AActor* Parent = nullptr;
   	FVector ECEFForwardHorizontal;
 
+	// Last ground altitude (geographic, meters) found below the vehicle - used when the ground raycast misses
+	bool bHasLastGoodGround = false;
+	double LastGoodGroundAltitudeMeters = 0.0;
+	double LastGroundWarningTime = -1000.0;
+
 	/////////// JSBSim Private methods
 	void DoTrim();
+
+	/** True if the FDM's position, velocity or attitude has gone NaN/Inf */
+	bool HasNonFiniteState() const;
+
+	/** Log the last good state and the forces acting on the vehicle, then stop the simulation */
+	void HandleNonFiniteState(int32 SubStep);
 
 	void UpdateLocalTransforms();
 
